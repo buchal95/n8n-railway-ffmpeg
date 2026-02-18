@@ -10,7 +10,10 @@ const app = express();
 app.use(express.json({ limit: '50mb' }));
 
 const TMP_DIR = '/tmp/ffmpeg-jobs';
+const FONT_CACHE = '/app/fonts';
+
 if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
+if (!fs.existsSync(FONT_CACHE)) fs.mkdirSync(FONT_CACHE, { recursive: true });
 
 // ==================== HELPERS ====================
 
@@ -61,47 +64,111 @@ function cleanup(jobDir) {
   }, 60000);
 }
 
+/**
+ * Resolve font path for drawtext filter.
+ * Priority:
+ *   1. overlay.font_url  — download & cache (per-client branding)
+ *   2. overlay.font_name — lookup in cache by partial name match
+ *   3. DejaVu Sans Bold  — default fallback (supports Czech diacritics)
+ */
+async function resolveFont(overlay) {
+  const DEFAULT_FONT = '/usr/share/fonts/ttf-dejavu/DejaVuSans-Bold.ttf';
+
+  // 1. Font URL — download once, then serve from cache
+  if (overlay.font_url) {
+    try {
+      const fontName = path.basename(new URL(overlay.font_url).pathname);
+      const fontPath = path.join(FONT_CACHE, fontName);
+      if (!fs.existsSync(fontPath)) {
+        console.log(`[fonts] Downloading: ${fontName} from ${overlay.font_url}`);
+        await downloadFile(overlay.font_url, fontPath);
+        console.log(`[fonts] Cached: ${fontPath}`);
+      } else {
+        console.log(`[fonts] Using cached: ${fontPath}`);
+      }
+      return fontPath;
+    } catch (err) {
+      console.warn(`[fonts] Failed to download font: ${err.message}, using default`);
+      return DEFAULT_FONT;
+    }
+  }
+
+  // 2. Font name — match against cached files
+  if (overlay.font_name) {
+    try {
+      const cached = fs.readdirSync(FONT_CACHE)
+        .find(f => f.toLowerCase().includes(overlay.font_name.toLowerCase()));
+      if (cached) {
+        const fontPath = path.join(FONT_CACHE, cached);
+        console.log(`[fonts] Matched by name "${overlay.font_name}": ${fontPath}`);
+        return fontPath;
+      }
+      console.warn(`[fonts] Font "${overlay.font_name}" not found in cache, using default`);
+    } catch (err) {
+      console.warn(`[fonts] Cache lookup failed: ${err.message}`);
+    }
+  }
+
+  // 3. Default
+  return DEFAULT_FONT;
+}
+
 // ==================== ROUTES ====================
 
 // Health check
 app.get('/health', (req, res) => {
   try {
     const version = execSync('ffmpeg -version').toString().split('\n')[0];
-    res.json({ status: 'ok', ffmpeg: version });
+    const cachedFonts = fs.readdirSync(FONT_CACHE);
+    res.json({
+      status: 'ok',
+      ffmpeg: version,
+      cached_fonts: cachedFonts
+    });
   } catch (e) {
     res.status(500).json({ status: 'error', message: 'FFmpeg not found' });
   }
 });
 
+// List cached fonts
+app.get('/fonts', (req, res) => {
+  try {
+    const fonts = fs.readdirSync(FONT_CACHE).map(f => ({
+      name: f,
+      path: path.join(FONT_CACHE, f),
+      size_kb: Math.round(fs.statSync(path.join(FONT_CACHE, f)).size / 1024)
+    }));
+    res.json({ fonts, default: '/usr/share/fonts/ttf-dejavu/DejaVuSans-Bold.ttf' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ==================== MAIN: /process ====================
 //
-// Priklad requestu z n8n:
+// Request z n8n:
 // POST /process
 // {
 //   "clips": [
 //     { "url": "https://cdn.seedance.ai/clip1.mp4" },
-//     { "url": "https://cdn.seedance.ai/clip2.mp4" },
-//     { "url": "https://cdn.seedance.ai/clip3.mp4" }
+//     { "url": "https://cdn.seedance.ai/clip2.mp4" }
 //   ],
 //   "crossfade": 0.4,
 //   "output": { "width": 1080, "height": 1920, "fps": 30 },
 //   "overlay": {
-//     "logo_url": "https://example.com/nyaderm-logo.png",
+//     "logo_url": "https://example.com/logo.png",
 //     "logo_position": "top_center",
 //     "logo_size": 120,
-//     "text": "Dual ProBio — 7 miliard živých bakterií",
+//     "text": "CTA text here",
 //     "text_position": "safe_center",
 //     "font_size": 42,
 //     "font_color": "white",
-//     "text_bg": "black@0.5"
+//     "text_bg": "black@0.5",
+//     "font_url": "https://storage.example.com/fonts/Montserrat-Bold.ttf",
+//     "font_name": "Montserrat"
 //   },
-//
-//   // Audio — varianta A: URL (veřejně dostupný soubor)
-//   "audio_url": "https://example.com/background-music.mp3",
-//
-//   // Audio — varianta B: base64 (posíláno přímo z n8n, bez potřeby hostingu)
-//   "audio_data": "UklGRi4A...",  // base64-encoded MP3/WAV
-//
+//   "audio_url": "https://example.com/music.mp3",
+//   "audio_data": "base64...",
 //   "fade_in": 0.5,
 //   "fade_out": 0.5
 // }
@@ -237,6 +304,7 @@ app.post('/process', async (req, res) => {
 
       // -- Text --
       if (overlay.text) {
+        const fontPath = await resolveFont(overlay);
         const fontSize = overlay.font_size || 42;
         const fontColor = overlay.font_color || 'white';
         const textBg = overlay.text_bg || 'black@0.5';
@@ -258,6 +326,7 @@ app.post('/process', async (req, res) => {
 
         filters.push(
           `[${lastLabel}]drawtext=text='${escapedText}':` +
+          `fontfile=${fontPath}:` +
           `fontsize=${fontSize}:fontcolor=${fontColor}:` +
           `x=(w-tw)/2:y=${textY}:` +
           `box=1:boxcolor=${textBg}:boxborderw=15[withtext]`
@@ -280,12 +349,10 @@ app.post('/process', async (req, res) => {
       const audioPath = path.join(jobDir, 'audio.mp3');
 
       if (audio_data) {
-        // Base64 → soubor na disk
         const buffer = Buffer.from(audio_data, 'base64');
         fs.writeFileSync(audioPath, buffer);
         console.log(`[${jobId}] Decoded base64 audio: ${(buffer.length / 1024).toFixed(0)}KB`);
       } else {
-        // Stáhnout z URL
         await downloadFile(audio_url, audioPath);
       }
 
@@ -308,11 +375,11 @@ app.post('/process', async (req, res) => {
     console.log(`[${jobId}] Adding video fades...`);
     const finalPath = path.join(jobDir, `output_${jobId}.mp4`);
     const totalDuration = getVideoDuration(currentPath);
-    const fadeOutStart = (totalDuration - fade_out).toFixed(2);
+    const vfadeOutStart = (totalDuration - fade_out).toFixed(2);
 
     await runFFmpeg(
       `ffmpeg -y -i "${currentPath}" ` +
-      `-vf "fade=t=in:st=0:d=${fade_in},fade=t=out:st=${fadeOutStart}:d=${fade_out}" ` +
+      `-vf "fade=t=in:st=0:d=${fade_in},fade=t=out:st=${vfadeOutStart}:d=${fade_out}" ` +
       `-c:v libx264 -preset fast -crf 23 ` +
       `${hasAudio ? '-c:a copy' : '-an'} "${finalPath}"`
     );
@@ -367,5 +434,5 @@ app.post('/probe', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`FFmpeg service running on port ${PORT}`);
-  console.log(`Endpoints: GET /health, POST /process, POST /probe`);
+  console.log(`Endpoints: GET /health, GET /fonts, POST /process, POST /probe`);
 });
