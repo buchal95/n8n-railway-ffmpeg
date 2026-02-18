@@ -95,7 +95,13 @@ app.get('/health', (req, res) => {
 //     "font_color": "white",
 //     "text_bg": "black@0.5"
 //   },
+//
+//   // Audio — varianta A: URL (veřejně dostupný soubor)
 //   "audio_url": "https://example.com/background-music.mp3",
+//
+//   // Audio — varianta B: base64 (posíláno přímo z n8n, bez potřeby hostingu)
+//   "audio_data": "UklGRi4A...",  // base64-encoded MP3/WAV
+//
 //   "fade_in": 0.5,
 //   "fade_out": 0.5
 // }
@@ -112,6 +118,7 @@ app.post('/process', async (req, res) => {
       output = { width: 1080, height: 1920, fps: 30 },
       overlay = {},
       audio_url = null,
+      audio_data = null,
       fade_in = 0.5,
       fade_out = 0.5
     } = req.body;
@@ -266,11 +273,21 @@ app.post('/process', async (req, res) => {
       currentPath = overlayPath;
     }
 
-    // ---- STEP 5: Audio track ----
-    if (audio_url) {
-      console.log(`[${jobId}] Adding audio...`);
+    // ---- STEP 5: Audio track (supports URL or base64) ----
+    const hasAudio = audio_url || audio_data;
+    if (hasAudio) {
+      console.log(`[${jobId}] Adding audio (${audio_data ? 'base64' : 'url'})...`);
       const audioPath = path.join(jobDir, 'audio.mp3');
-      await downloadFile(audio_url, audioPath);
+
+      if (audio_data) {
+        // Base64 → soubor na disk
+        const buffer = Buffer.from(audio_data, 'base64');
+        fs.writeFileSync(audioPath, buffer);
+        console.log(`[${jobId}] Decoded base64 audio: ${(buffer.length / 1024).toFixed(0)}KB`);
+      } else {
+        // Stáhnout z URL
+        await downloadFile(audio_url, audioPath);
+      }
 
       const videoDur = getVideoDuration(currentPath);
       const withAudioPath = path.join(jobDir, 'with_audio.mp4');
@@ -297,7 +314,7 @@ app.post('/process', async (req, res) => {
       `ffmpeg -y -i "${currentPath}" ` +
       `-vf "fade=t=in:st=0:d=${fade_in},fade=t=out:st=${fadeOutStart}:d=${fade_out}" ` +
       `-c:v libx264 -preset fast -crf 23 ` +
-      `${audio_url ? '-c:a copy' : '-an'} "${finalPath}"`
+      `${hasAudio ? '-c:a copy' : '-an'} "${finalPath}"`
     );
 
     // ---- STEP 7: Send result ----
