@@ -1,7 +1,12 @@
 {
   "name": "ffmpeg-service",
   "version": "1.0.0",
+  "description": "FFmpeg video processing microservice for n8n workflows",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
-    "express": "^4.18.2"
+    "express": "^4.21.0"
   }
 }
