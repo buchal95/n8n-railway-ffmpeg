@@ -11,9 +11,14 @@ app.use(express.json({ limit: '50mb' }));
 
 const TMP_DIR = '/tmp/ffmpeg-jobs';
 const FONT_CACHE = '/app/fonts';
+const MAX_JOBS = 2; // Concurrency limit — adjust based on Railway plan
 
 if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
 if (!fs.existsSync(FONT_CACHE)) fs.mkdirSync(FONT_CACHE, { recursive: true });
+
+// ==================== CONCURRENCY ====================
+
+let activeJobs = 0;
 
 // ==================== HELPERS ====================
 
@@ -44,7 +49,7 @@ function downloadFile(url, dest) {
 function runFFmpeg(cmd) {
   return new Promise((resolve, reject) => {
     console.log(`[ffmpeg] ${cmd.substring(0, 200)}...`);
-    exec(cmd, { maxBuffer: 50 * 1024 * 1024, timeout: 300000 }, (err, stdout, stderr) => {
+    exec(cmd, { maxBuffer: 50 * 1024 * 1024, timeout: 600000 }, (err, stdout, stderr) => {
       if (err) reject(new Error(`FFmpeg error: ${stderr || err.message}`));
       else resolve(stdout);
     });
@@ -123,7 +128,9 @@ app.get('/health', (req, res) => {
     res.json({
       status: 'ok',
       ffmpeg: version,
-      cached_fonts: cachedFonts
+      cached_fonts: cachedFonts,
+      active_jobs: activeJobs,
+      max_jobs: MAX_JOBS
     });
   } catch (e) {
     res.status(500).json({ status: 'error', message: 'FFmpeg not found' });
@@ -145,35 +152,18 @@ app.get('/fonts', (req, res) => {
 });
 
 // ==================== MAIN: /process ====================
-//
-// Request z n8n:
-// POST /process
-// {
-//   "clips": [
-//     { "url": "https://cdn.seedance.ai/clip1.mp4" },
-//     { "url": "https://cdn.seedance.ai/clip2.mp4" }
-//   ],
-//   "crossfade": 0.4,
-//   "output": { "width": 1080, "height": 1920, "fps": 30 },
-//   "overlay": {
-//     "logo_url": "https://example.com/logo.png",
-//     "logo_position": "top_center",
-//     "logo_size": 120,
-//     "text": "CTA text here",
-//     "text_position": "safe_center",
-//     "font_size": 42,
-//     "font_color": "white",
-//     "text_bg": "black@0.5",
-//     "font_url": "https://storage.example.com/fonts/Montserrat-Bold.ttf",
-//     "font_name": "Montserrat"
-//   },
-//   "audio_url": "https://example.com/music.mp3",
-//   "audio_data": "base64...",
-//   "fade_in": 0.5,
-//   "fade_out": 0.5
-// }
 
 app.post('/process', async (req, res) => {
+  // ---- Concurrency guard ----
+  if (activeJobs >= MAX_JOBS) {
+    return res.status(429).json({
+      error: 'Server busy, try again later',
+      active_jobs: activeJobs,
+      max_jobs: MAX_JOBS
+    });
+  }
+  activeJobs++;
+
   const jobId = crypto.randomBytes(8).toString('hex');
   const jobDir = path.join(TMP_DIR, jobId);
   fs.mkdirSync(jobDir, { recursive: true });
@@ -198,15 +188,13 @@ app.post('/process', async (req, res) => {
     const H = output.height || 1920;
     const FPS = output.fps || 30;
 
-    // ---- STEP 1: Download all clips ----
-    console.log(`[${jobId}] Downloading ${clips.length} clips...`);
-    const clipPaths = [];
-    for (let i = 0; i < clips.length; i++) {
-      const clipPath = path.join(jobDir, `clip_${i}.mp4`);
-      await downloadFile(clips[i].url, clipPath);
-      clipPaths.push(clipPath);
-      console.log(`[${jobId}] Downloaded clip ${i + 1}/${clips.length}`);
-    }
+    // ---- STEP 1: Download all clips (parallel) ----
+    console.log(`[${jobId}] Downloading ${clips.length} clips in parallel...`);
+    const clipPaths = clips.map((_, i) => path.join(jobDir, `clip_${i}.mp4`));
+    await Promise.all(
+      clips.map((clip, i) => downloadFile(clip.url, clipPaths[i]))
+    );
+    console.log(`[${jobId}] All ${clips.length} clips downloaded`);
 
     // ---- STEP 2: Normalize all clips (same resolution, fps) ----
     console.log(`[${jobId}] Normalizing clips to ${W}x${H} @ ${FPS}fps...`);
@@ -237,6 +225,16 @@ app.post('/process', async (req, res) => {
       const durations = normalizedPaths.map(p => getVideoDuration(p));
       console.log(`[${jobId}] Clip durations:`, durations);
 
+      // Validate: each clip must be longer than crossfade
+      for (let i = 0; i < durations.length; i++) {
+        if (durations[i] <= crossfade) {
+          throw new Error(
+            `Clip ${i} is too short (${durations[i].toFixed(2)}s) for crossfade (${crossfade}s). ` +
+            `Each clip must be longer than the crossfade duration.`
+          );
+        }
+      }
+
       // Build xfade filter chain
       let filterParts = [];
       let prevLabel = '0:v';
@@ -259,7 +257,7 @@ app.post('/process', async (req, res) => {
       );
     }
 
-    // ---- STEP 4: Overlays (logo + text) with Meta safe zones ----
+    // ---- STEP 4: Overlays (logo + text) + video fades (merged = 1 re-encode) ----
     //
     // 9:16 Meta Safe Zones (1080x1920):
     //   Top unsafe:    0 - 269px  (14%) — username, icons
@@ -271,9 +269,11 @@ app.post('/process', async (req, res) => {
     const SAFE_CENTER_Y = Math.round((SAFE_TOP + SAFE_BOTTOM) / 2);
 
     let currentPath = concatPath;
+    const hasOverlay = overlay.logo_url || overlay.text;
+    const hasFades = fade_in > 0 || fade_out > 0;
 
-    if (overlay.logo_url || overlay.text) {
-      console.log(`[${jobId}] Adding overlays...`);
+    if (hasOverlay || hasFades) {
+      console.log(`[${jobId}] Adding overlays + video fades (single pass)...`);
       const overlayPath = path.join(jobDir, 'overlay.mp4');
       let filters = [];
       let extraInputs = '';
@@ -322,7 +322,10 @@ app.post('/process', async (req, res) => {
           .replace(/\\/g, '\\\\\\\\')
           .replace(/'/g, "'\\\\\\''")
           .replace(/:/g, '\\\\:')
-          .replace(/%/g, '%%');
+          .replace(/%/g, '%%')
+          .replace(/;/g, '\\\\;')
+          .replace(/\[/g, '\\\\[')
+          .replace(/\]/g, '\\\\]');
 
         filters.push(
           `[${lastLabel}]drawtext=text='${escapedText}':` +
@@ -332,6 +335,20 @@ app.post('/process', async (req, res) => {
           `box=1:boxcolor=${textBg}:boxborderw=15[withtext]`
         );
         lastLabel = 'withtext';
+      }
+
+      // -- Video fades (merged into same filter chain) --
+      if (hasFades) {
+        const totalDuration = getVideoDuration(currentPath);
+        const vfadeOutStart = (totalDuration - fade_out).toFixed(2);
+        let fadeParts = [];
+        if (fade_in > 0) fadeParts.push(`fade=t=in:st=0:d=${fade_in}`);
+        if (fade_out > 0) fadeParts.push(`fade=t=out:st=${vfadeOutStart}:d=${fade_out}`);
+
+        filters.push(
+          `[${lastLabel}]${fadeParts.join(',')}[final]`
+        );
+        lastLabel = 'final';
       }
 
       await runFFmpeg(
@@ -371,20 +388,8 @@ app.post('/process', async (req, res) => {
       currentPath = withAudioPath;
     }
 
-    // ---- STEP 6: Final fade in/out on video ----
-    console.log(`[${jobId}] Adding video fades...`);
-    const finalPath = path.join(jobDir, `output_${jobId}.mp4`);
-    const totalDuration = getVideoDuration(currentPath);
-    const vfadeOutStart = (totalDuration - fade_out).toFixed(2);
-
-    await runFFmpeg(
-      `ffmpeg -y -i "${currentPath}" ` +
-      `-vf "fade=t=in:st=0:d=${fade_in},fade=t=out:st=${vfadeOutStart}:d=${fade_out}" ` +
-      `-c:v libx264 -preset fast -crf 23 ` +
-      `${hasAudio ? '-c:a copy' : '-an'} "${finalPath}"`
-    );
-
-    // ---- STEP 7: Send result ----
+    // ---- STEP 6: Send result ----
+    const finalPath = currentPath;
     const finalDuration = getVideoDuration(finalPath);
     const stat = fs.statSync(finalPath);
     console.log(`[${jobId}] Done! Duration: ${finalDuration.toFixed(1)}s, Size: ${(stat.size / 1024 / 1024).toFixed(1)}MB`);
@@ -397,11 +402,14 @@ app.post('/process', async (req, res) => {
     const stream = fs.createReadStream(finalPath);
     stream.pipe(res);
     stream.on('end', () => cleanup(jobDir));
+    stream.on('error', () => cleanup(jobDir));
 
   } catch (err) {
     console.error(`[${jobId}] Error:`, err.message);
     cleanup(jobDir);
     res.status(500).json({ error: err.message });
+  } finally {
+    activeJobs--;
   }
 });
 
@@ -435,4 +443,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`FFmpeg service running on port ${PORT}`);
   console.log(`Endpoints: GET /health, GET /fonts, POST /process, POST /probe`);
+  console.log(`Concurrency limit: ${MAX_JOBS} jobs`);
 });
